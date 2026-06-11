@@ -1,683 +1,221 @@
 from __future__ import annotations
 
 import json
-import math
-import uuid
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-
-@dataclass
-class AgentToolInput:
-    """Structured input passed into an agent tool."""
-
-    payload: Dict[str, Any]
+from cage.evaluation import Evaluator
+from cage.mcts import MCTSConfig, MCTSNode, MCTSSearcher
+from cage.tools import ToolRegistry, register_default_tools
 
 
-@dataclass
-class AgentToolOutput:
-    """Standardized output returned by an agent tool."""
+class LLMController:
+    """LLM controller for Thought/Action generation.
 
-    content: Any
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    success: bool = True
-    error: Optional[str] = None
-
-
-class AgentBaseTool(ABC):
-    """Abstract base class for tools used by the generic MCTS agent.
-
-    A concrete tool may wrap a search API, database retriever, VQA model,
-    code executor, or any other external capability.
+    This default implementation is runnable and deterministic. Replace
+    `complete()` with a real LLM backend when deploying. Keep the public methods
+    stable so MCTS remains independent from provider SDKs and model versions.
     """
 
-    name: str
-    description: str
+    def __init__(self, tool_registry: ToolRegistry, system_prompt: Optional[str] = None) -> None:
+        self.tool_registry = tool_registry
+        self.system_prompt = system_prompt or self.default_system_prompt()
 
-    @abstractmethod
-    def execute(self, tool_input: AgentToolInput) -> AgentToolOutput:
-        raise NotImplementedError
+    def propose_next(self, query: str, history: List[Dict[str, Any]]) -> Tuple[str, str, str]:
+        """Generate next Thought, Action name, and Action input."""
+        prompt = self.build_action_prompt(query, history)
+        raw = self.complete(prompt)
+        return self.parse_action_response(raw, query, history)
 
-    def schema(self) -> Dict[str, Any]:
-        """Return a JSON-schema-like description exposed to the LLM controller."""
-        return {
-            "name": self.name,
-            "description": self.description,
-            "input_schema": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": True,
-            },
-        }
+    def execute_action(self, action_name: str, action_input: str) -> str:
+        if not action_name:
+            return ""
+        try:
+            return self.tool_registry.execute(action_name, action_input)
+        except Exception as exc:
+            return f"[ToolError] action={action_name}, error={exc}"
 
+    def complete(self, prompt: str) -> str:
+        """Provider hook.
 
-class ToolRegistry:
-    """Dynamic registry and execution center for agent tools."""
+        Replace this method with a call to your preferred LLM/LVLM runtime.
 
-    def __init__(self) -> None:
-        self._tools: Dict[str, AgentBaseTool] = {}
+        Expected prompt input:
+            - system instruction
+            - user query
+            - current Thought/Action/Observation history
+            - registered tool descriptions
 
-    def register(self, tool: AgentBaseTool) -> None:
-        if tool.name in self._tools:
-            raise ValueError(f"Tool already registered: {tool.name}")
-        self._tools[tool.name] = tool
-
-    def unregister(self, tool_name: str) -> None:
-        self._tools.pop(tool_name, None)
-
-    def get(self, tool_name: str) -> AgentBaseTool:
-        if tool_name not in self._tools:
-            raise KeyError(f"Tool not found: {tool_name}")
-        return self._tools[tool_name]
-
-    def list_tools(self) -> List[AgentBaseTool]:
-        return list(self._tools.values())
-
-    def tool_schemas(self) -> List[Dict[str, Any]]:
-        return [tool.schema() for tool in self._tools.values()]
-
-    def execute(self, tool_name: str, tool_input: AgentToolInput) -> AgentToolOutput:
-        return self.get(tool_name).execute(tool_input)
-
-
-@dataclass
-class AgentAction:
-    """A tool action proposed by the LLM controller."""
-
-    tool_name: str
-    tool_input: AgentToolInput
-    reasoning: str = ""
-
-
-@dataclass
-class ReasoningStep:
-    """One Thought -> Action -> Observation step."""
-
-    thought: str
-    action: Optional[AgentAction]
-    observation: Optional[AgentToolOutput]
-
-
-@dataclass
-class EvaluationResult:
-    """Dual value evaluation for a trajectory."""
-
-    trajectory_score: float
-    confidence_score: float
-    value: float
-    is_decisive: bool = False
-    explanation: str = ""
-
-
-@dataclass
-class AgentSearchResult:
-    """Final search result returned by MCTSAgent.search()."""
-
-    best_node: "AgentMCTSNode"
-    best_trajectory: List[ReasoningStep]
-    final_answer: Optional[str]
-    root: "AgentMCTSNode"
-
-
-class LLMController(ABC):
-    """Provider-neutral LLM controller interface.
-
-    Concrete implementations can wrap Claude, OpenAI, Gemini, local vLLM,
-    Qwen, Llama, or any custom model server. This core skeleton intentionally
-    contains no provider-specific SDK calls.
-    """
-
-    @abstractmethod
-    def generate_thought_and_action(
-        self,
-        system_prompt: str,
-        task: str,
-        trajectory: List[ReasoningStep],
-        available_tools: List[Dict[str, Any]],
-    ) -> Tuple[str, Optional[AgentAction]]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def evaluate_trajectory(
-        self,
-        system_prompt: str,
-        task: str,
-        trajectory: List[ReasoningStep],
-    ) -> Tuple[float, str]:
-        """Return S^T, the trajectory coherence score in [0, 1]."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def evaluate_confidence(
-        self,
-        system_prompt: str,
-        task: str,
-        trajectory: List[ReasoningStep],
-    ) -> Tuple[float, str]:
-        """Return S^C, the evidence sufficiency score in [0, 1]."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def generate_final_answer(
-        self,
-        system_prompt: str,
-        task: str,
-        trajectory: List[ReasoningStep],
-    ) -> str:
-        raise NotImplementedError
-
-
-class PromptBuilder:
-    """Prompt construction points for real LLM integration."""
-
-    def build_action_prompt(
-        self,
-        task: str,
-        trajectory: List[ReasoningStep],
-        available_tools: List[Dict[str, Any]],
-    ) -> str:
-        """Build the prompt used to request the next Thought and Action.
-
-        A concrete LLMController should call an LLM here and request structured
-        output such as {"thought": ..., "action": {"tool_name": ..., ...}}.
+        Expected model output JSON:
+            {
+              "thought": "short reasoning step",
+              "action": "registered_tool_name or empty string",
+              "action_input": "string payload for the tool"
+            }
         """
-        trajectory_text = self.format_trajectory(trajectory)
-        tools_text = json.dumps(available_tools, ensure_ascii=False, indent=2)
+        # Deterministic fallback policy for local smoke tests.
+        lower_prompt = prompt.lower()
+        if "forgery" in lower_prompt or "image" in lower_prompt or "visual" in lower_prompt:
+            action = "forgery_detection"
+        elif "step_count: 0" in lower_prompt:
+            action = "web_search"
+        elif "step_count: 1" in lower_prompt:
+            action = "text_verifier"
+        else:
+            action = ""
+        return json.dumps(
+            {
+                "thought": "Plan the next evidence-gathering step based on the current trajectory.",
+                "action": action,
+                "action_input": self._extract_query_from_prompt(prompt),
+            },
+            ensure_ascii=False,
+        )
+
+    def build_action_prompt(self, query: str, history: List[Dict[str, Any]]) -> str:
+        """Build the LLM prompt for Thought/Action generation."""
         return f"""
-You are an LLM controller inside a tool-augmented MCTS reasoning agent.
+{self.system_prompt}
 
-Task:
-{task}
+You are controlling one expansion step in an MCTS tree for tool-augmented reasoning.
 
-Current trajectory:
-{trajectory_text}
+User query:
+{query}
+
+Current history as JSON:
+{json.dumps(history, ensure_ascii=False, indent=2)}
+
+STEP_COUNT: {len(history)}
 
 Available tools:
-{tools_text}
+{self.tool_registry.describe_tools()}
 
-Generate the next reasoning step:
-1. Thought: what should be verified or explored next?
-2. Action: which tool should be called, with what input?
+Decide the next Thought and Action.
 
-Return a structured action. If no tool is needed, return action=null.
-""".strip()
-
-    def build_trajectory_evaluation_prompt(self, task: str, trajectory: List[ReasoningStep]) -> str:
-        """Build the prompt for S^T trajectory scoring."""
-        return f"""
-Evaluate the logical coherence of the following reasoning trajectory.
-
-Task:
-{task}
-
-Trajectory:
-{self.format_trajectory(trajectory)}
-
-Score the trajectory from 0 to 1.
-
-Consider:
-- Are the thoughts coherent?
-- Are the actions relevant?
-- Are observations used correctly?
-- Does the trajectory avoid unsupported jumps?
-
-Return:
+Output strict JSON only:
 {{
-  "score": float,
-  "explanation": str
+  "thought": "<what to verify or reason about next>",
+  "action": "<one registered tool name, or empty string if no tool is needed>",
+  "action_input": "<string input to pass to the selected tool>"
 }}
 """.strip()
 
-    def build_confidence_evaluation_prompt(self, task: str, trajectory: List[ReasoningStep]) -> str:
-        """Build the prompt for S^C confidence scoring."""
-        return f"""
-Evaluate whether the collected observations are sufficient to answer the task.
-
-Task:
-{task}
-
-Trajectory:
-{self.format_trajectory(trajectory)}
-
-Score confidence from 0 to 1.
-
-Consider:
-- Is the evidence enough?
-- Are there unresolved ambiguities?
-- Are there conflicting observations?
-- Can a final conclusion be made safely?
-
-Return:
-{{
-  "score": float,
-  "explanation": str,
-  "is_decisive": bool
-}}
-""".strip()
-
-    def build_final_answer_prompt(self, task: str, trajectory: List[ReasoningStep]) -> str:
-        return f"""
-Use the following tool-augmented reasoning trajectory to answer the task.
-
-Task:
-{task}
-
-Trajectory:
-{self.format_trajectory(trajectory)}
-
-Provide:
-1. Final answer
-2. Key evidence
-3. Remaining uncertainty, if any
-""".strip()
-
-    def format_trajectory(self, trajectory: List[ReasoningStep]) -> str:
-        if not trajectory:
-            return "<empty trajectory>"
-
-        lines: List[str] = []
-        for i, step in enumerate(trajectory, start=1):
-            lines.append(f"Step {i}:")
-            lines.append(f"Thought: {step.thought}")
-            if step.action is None:
-                lines.append("Action: None")
-            else:
-                lines.append(f"Action Tool: {step.action.tool_name}")
-                lines.append(f"Action Input: {step.action.tool_input.payload}")
-                lines.append(f"Action Reasoning: {step.action.reasoning}")
-            if step.observation is None:
-                lines.append("Observation: None")
-            else:
-                lines.append(f"Observation Success: {step.observation.success}")
-                lines.append(f"Observation Content: {step.observation.content}")
-                if step.observation.error:
-                    lines.append(f"Observation Error: {step.observation.error}")
-                if step.observation.metadata:
-                    lines.append(f"Observation Metadata: {step.observation.metadata}")
-            lines.append("")
-        return "\n".join(lines)
-
-
-class AgentMCTSNode:
-    """MCTS tree node storing a Thought-Action-Observation trajectory prefix."""
-
-    def __init__(
+    def parse_action_response(
         self,
-        parent: Optional["AgentMCTSNode"] = None,
-        step: Optional[ReasoningStep] = None,
-        prior: float = 1.0,
-        depth: int = 0,
-    ) -> None:
-        self.node_id = str(uuid.uuid4())
-        self.parent = parent
-        self.children: List[AgentMCTSNode] = []
-        self.step = step
-        self.visit_count = 0
-        self.value_sum = 0.0
-        self.prior = prior
-        self.depth = depth
-        self.is_terminal = False
-        self.is_pruned = False
-        self.evaluation: Optional[EvaluationResult] = None
+        raw_response: str,
+        query: str,
+        history: List[Dict[str, Any]],
+    ) -> Tuple[str, str, str]:
+        try:
+            data = json.loads(raw_response)
+            thought = str(data.get("thought", "")).strip()
+            action = str(data.get("action", "")).strip()
+            action_input = str(data.get("action_input", query)).strip()
+        except json.JSONDecodeError:
+            thought = raw_response.strip() or "Continue reasoning."
+            action = "web_search" if not history else ""
+            action_input = query
 
-    @property
-    def mean_value(self) -> float:
-        return 0.0 if self.visit_count == 0 else self.value_sum / self.visit_count
+        if action and action not in self.tool_registry.list_tool_names():
+            action = "web_search" if "web_search" in self.tool_registry.list_tool_names() else ""
+        return thought, action, action_input
 
-    def add_child(self, child: "AgentMCTSNode") -> None:
-        self.children.append(child)
-
-    def trajectory(self) -> List[ReasoningStep]:
-        steps: List[ReasoningStep] = []
-        node: Optional[AgentMCTSNode] = self
-        while node is not None:
-            if node.step is not None:
-                steps.append(node.step)
-            node = node.parent
-        return list(reversed(steps))
-
-    def uct_score(self, exploration_constant: float) -> float:
-        """Improved UCT with prior initialization for low-visit nodes."""
-        parent_visits = 1 if self.parent is None else self.parent.visit_count
-        exploitation = self.value_sum / (self.visit_count + 1)
-        exploration = exploration_constant * math.sqrt(
-            math.log(parent_visits + 1) / (self.visit_count + 1)
-        )
-        prior_bonus = self.prior / (self.visit_count + 1)
-        return exploitation + exploration + prior_bonus
-
-    def best_child(self, exploration_constant: float) -> "AgentMCTSNode":
-        candidates = [child for child in self.children if not child.is_pruned]
-        if not candidates:
-            raise ValueError("No available non-pruned children.")
-        return max(candidates, key=lambda child: child.uct_score(exploration_constant))
-
-    def mark_pruned(self) -> None:
-        self.is_pruned = True
-        for child in self.children:
-            child.mark_pruned()
-
-    def __repr__(self) -> str:
+    def default_system_prompt(self) -> str:
         return (
-            f"AgentMCTSNode(id={self.node_id[:8]}, depth={self.depth}, "
-            f"N={self.visit_count}, V={self.value_sum:.3f}, mean={self.mean_value:.3f}, "
-            f"children={len(self.children)}, terminal={self.is_terminal}, pruned={self.is_pruned})"
+            "You are a rigorous multimodal tool-augmented reasoning controller. "
+            "You choose tools only when they can improve evidence quality. "
+            "Prefer concise, inspectable Thought/Action decisions."
         )
+
+    def _extract_query_from_prompt(self, prompt: str) -> str:
+        match = re.search(r"User query:\n(?P<query>.*?)\n\nCurrent history", prompt, re.S)
+        return match.group("query").strip() if match else prompt[:512]
 
 
 @dataclass
-class MCTSAgentConfig:
-    max_iterations: int = 32
-    max_depth: int = 5
-    exploration_constant: float = 1.414
-    alpha: float = 0.5
-    decisive_confidence_threshold: float = 0.9
-    expansion_width: int = 1
-    prune_siblings_on_decisive: bool = True
+class AgentDecision:
+    query: str
+    answer: str
+    confidence: float
+    value: float
+    trajectory: List[Dict[str, Any]]
+    evidence: List[str]
+    best_node: MCTSNode
 
 
-class MCTSAgent:
-    """LLM-controlled, tool-augmented MCTS agent.
+class T2Agent:
+    """Top-level LLM + Tools + MCTS agent wrapper.
 
-    Main lifecycle:
-        select -> expand -> evaluate -> backpropagate -> prune -> answer
+    T2Agent initializes the singleton ToolRegistry, the dual Evaluator, and the
+    MCTSSearcher. `run(query)` is the main external entry point.
     """
 
     def __init__(
         self,
-        llm_controller: LLMController,
-        tool_registry: ToolRegistry,
-        prompt_builder: Optional[PromptBuilder] = None,
-        config: Optional[MCTSAgentConfig] = None,
-        system_prompt: str = "",
+        controller: Optional[LLMController] = None,
+        registry: Optional[ToolRegistry] = None,
+        evaluator: Optional[Evaluator] = None,
+        mcts_config: Optional[MCTSConfig] = None,
+        register_defaults: bool = True,
     ) -> None:
-        self.llm = llm_controller
-        self.tools = tool_registry
-        self.prompt_builder = prompt_builder or PromptBuilder()
-        self.config = config or MCTSAgentConfig()
-        self.system_prompt = system_prompt
-
-    def search(self, task: str) -> AgentSearchResult:
-        """Run the planning -> action -> observation -> evaluation -> decision loop."""
-        root = AgentMCTSNode(parent=None, step=None, prior=1.0, depth=0)
-
-        for _ in range(self.config.max_iterations):
-            selected = self.select(root)
-            if selected.is_pruned:
-                continue
-
-            expanded = self.expand(selected, task)
-            target = expanded if expanded is not None else selected
-
-            evaluation = self.evaluate(target, task)
-            target.evaluation = evaluation
-
-            self.backpropagate(target, evaluation.value)
-
-            if evaluation.is_decisive:
-                self.prune(target)
-
-            if self.has_decisive_child(root):
-                break
-
-        best_node = self.choose_best_final_node(root)
-        best_trajectory = best_node.trajectory()
-        final_answer = self.llm.generate_final_answer(
-            system_prompt=self.system_prompt,
-            task=task,
-            trajectory=best_trajectory,
+        self.registry = registry or ToolRegistry()
+        if register_defaults:
+            register_default_tools(self.registry, overwrite=True)
+        self.controller = controller or LLMController(self.registry)
+        self.evaluator = evaluator or Evaluator(alpha=0.5)
+        self.searcher = MCTSSearcher(
+            controller=self.controller,
+            evaluator=self.evaluator,
+            config=mcts_config or MCTSConfig(),
         )
-        return AgentSearchResult(best_node, best_trajectory, final_answer, root)
 
-    def select(self, root: AgentMCTSNode) -> AgentMCTSNode:
-        node = root
-        while True:
-            if node.is_terminal or node.depth >= self.config.max_depth:
-                return node
-            available_children = [child for child in node.children if not child.is_pruned]
-            if not available_children:
-                return node
-            node = node.best_child(self.config.exploration_constant)
-
-    def expand(self, node: AgentMCTSNode, task: str) -> Optional[AgentMCTSNode]:
-        if node.depth >= self.config.max_depth:
-            node.is_terminal = True
-            return None
-
-        trajectory = node.trajectory()
-        thought, action = self.llm.generate_thought_and_action(
-            system_prompt=self.system_prompt,
-            task=task,
+    def run(self, query: str) -> AgentDecision:
+        """Run MCTS search and return a final fused decision."""
+        best_node = self.searcher.search(query)
+        trajectory = best_node.trajectory()
+        evidence = best_node.evidence()
+        trajectory_score, confidence_score, value = self.evaluator.evaluate(trajectory, evidence, query)
+        answer = self.make_final_decision(query, trajectory, evidence, confidence_score, value)
+        return AgentDecision(
+            query=query,
+            answer=answer,
+            confidence=confidence_score,
+            value=value,
             trajectory=trajectory,
-            available_tools=self.tools.tool_schemas(),
+            evidence=evidence,
+            best_node=best_node,
         )
 
-        observation = self.execute_action(action) if action is not None else None
-        step = ReasoningStep(thought=thought, action=action, observation=observation)
-        child = AgentMCTSNode(
-            parent=node,
-            step=step,
-            prior=self.estimate_prior(thought, action, observation),
-            depth=node.depth + 1,
-        )
-        node.add_child(child)
-        if child.depth >= self.config.max_depth:
-            child.is_terminal = True
-        return child
-
-    def execute_action(self, action: AgentAction) -> AgentToolOutput:
-        try:
-            return self.tools.execute(action.tool_name, action.tool_input)
-        except Exception as exc:
-            return AgentToolOutput(
-                content=None,
-                success=False,
-                error=str(exc),
-                metadata={"tool_name": action.tool_name, "tool_input": action.tool_input.payload},
-            )
-
-    def estimate_prior(
+    def make_final_decision(
         self,
-        thought: str,
-        action: Optional[AgentAction],
-        observation: Optional[AgentToolOutput],
-    ) -> float:
-        if action is None:
-            return 0.5
-        if observation is not None and observation.success:
-            return 1.0
-        return 0.7
-
-    def evaluate(self, node: AgentMCTSNode, task: str) -> EvaluationResult:
-        trajectory = node.trajectory()
-        trajectory_score, trajectory_explanation = self.llm.evaluate_trajectory(
-            self.system_prompt,
-            task,
-            trajectory,
-        )
-        confidence_score, confidence_explanation = self.llm.evaluate_confidence(
-            self.system_prompt,
-            task,
-            trajectory,
-        )
-        value = self.config.alpha * trajectory_score + (1.0 - self.config.alpha) * confidence_score
-        is_decisive = confidence_score >= self.config.decisive_confidence_threshold
-        explanation = (
-            f"Trajectory evaluation: {trajectory_explanation}\n"
-            f"Confidence evaluation: {confidence_explanation}"
-        )
-        return EvaluationResult(trajectory_score, confidence_score, value, is_decisive, explanation)
-
-    def backpropagate(self, node: AgentMCTSNode, value: float) -> None:
-        current: Optional[AgentMCTSNode] = node
-        while current is not None:
-            current.visit_count += 1
-            current.value_sum += value
-            current = current.parent
-
-    def prune(self, decisive_node: AgentMCTSNode) -> None:
-        decisive_node.is_terminal = True
-        if not self.config.prune_siblings_on_decisive or decisive_node.parent is None:
-            return
-        for sibling in decisive_node.parent.children:
-            if sibling is not decisive_node:
-                sibling.mark_pruned()
-
-    def has_decisive_child(self, root: AgentMCTSNode) -> bool:
-        return any(
-            node.evaluation is not None and node.evaluation.is_decisive
-            for node in self.collect_nodes(root)
-        )
-
-    def choose_best_final_node(self, root: AgentMCTSNode) -> AgentMCTSNode:
-        candidates = [node for node in self.collect_nodes(root) if node is not root and not node.is_pruned]
-        if not candidates:
-            return root
-        decisive = [node for node in candidates if node.evaluation is not None and node.evaluation.is_decisive]
-        if decisive:
-            return max(decisive, key=lambda node: node.mean_value)
-        return max(candidates, key=lambda node: node.mean_value)
-
-    def collect_nodes(self, root: AgentMCTSNode) -> List[AgentMCTSNode]:
-        nodes: List[AgentMCTSNode] = []
-        stack = [root]
-        while stack:
-            node = stack.pop()
-            nodes.append(node)
-            stack.extend(node.children)
-        return nodes
-
-
-class SearchTool(AgentBaseTool):
-    """Placeholder search tool for local skeleton tests."""
-
-    name = "search"
-    description = "Search external knowledge sources for evidence relevant to a query."
-
-    def execute(self, tool_input: AgentToolInput) -> AgentToolOutput:
-        query = tool_input.payload.get("query", "")
-        return AgentToolOutput(
-            content=f"Mock search result for query: {query}",
-            metadata={"query": query, "source": "mock_search"},
-            success=True,
-        )
-
-    def schema(self) -> Dict[str, Any]:
-        return {
-            "name": self.name,
-            "description": self.description,
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query."},
-                },
-                "required": ["query"],
-                "additionalProperties": False,
-            },
-        }
-
-
-class CalculatorTool(AgentBaseTool):
-    """Placeholder deterministic calculator tool.
-
-    Do not use eval in production; replace it with a safe parser.
-    """
-
-    name = "calculator"
-    description = "Evaluate a simple mathematical expression."
-
-    def execute(self, tool_input: AgentToolInput) -> AgentToolOutput:
-        expression = tool_input.payload.get("expression", "")
-        try:
-            result = eval(expression, {"__builtins__": {}})
-            return AgentToolOutput(content=result, metadata={"expression": expression}, success=True)
-        except Exception as exc:
-            return AgentToolOutput(
-                content=None,
-                metadata={"expression": expression},
-                success=False,
-                error=str(exc),
-            )
-
-    def schema(self) -> Dict[str, Any]:
-        return {
-            "name": self.name,
-            "description": self.description,
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": "Mathematical expression to evaluate.",
-                    },
-                },
-                "required": ["expression"],
-                "additionalProperties": False,
-            },
-        }
-
-
-class MockLLMController(LLMController):
-    """Mock controller for testing without a real LLM provider."""
-
-    def generate_thought_and_action(
-        self,
-        system_prompt: str,
-        task: str,
-        trajectory: List[ReasoningStep],
-        available_tools: List[Dict[str, Any]],
-    ) -> Tuple[str, Optional[AgentAction]]:
-        if len(trajectory) == 0:
-            return (
-                "I should search for relevant information first.",
-                AgentAction(
-                    tool_name="search",
-                    tool_input=AgentToolInput(payload={"query": task}),
-                    reasoning="Search can provide external evidence.",
-                ),
-            )
-        if len(trajectory) == 1:
-            return "I should check whether the gathered evidence is sufficient.", None
-        return "No further tool use is needed.", None
-
-    def evaluate_trajectory(
-        self,
-        system_prompt: str,
-        task: str,
-        trajectory: List[ReasoningStep],
-    ) -> Tuple[float, str]:
-        if not trajectory:
-            return 0.1, "Empty trajectory."
-        failed_steps = [
-            step for step in trajectory
-            if step.observation is not None and not step.observation.success
-        ]
-        if failed_steps:
-            return 0.4, "Some tool calls failed."
-        return 0.8, "Trajectory is logically coherent."
-
-    def evaluate_confidence(
-        self,
-        system_prompt: str,
-        task: str,
-        trajectory: List[ReasoningStep],
-    ) -> Tuple[float, str]:
-        has_observation = any(
-            step.observation is not None and step.observation.success
-            for step in trajectory
-        )
-        if has_observation:
-            return 0.92, "Evidence appears sufficient for a preliminary answer."
-        return 0.2, "No evidence has been collected."
-
-    def generate_final_answer(
-        self,
-        system_prompt: str,
-        task: str,
-        trajectory: List[ReasoningStep],
+        query: str,
+        trajectory: List[Dict[str, Any]],
+        evidence: List[str],
+        confidence: float,
+        value: float,
     ) -> str:
+        """Heuristic probability-fusion decision making.
+
+        Replace this with calibrated Bayesian fusion, learned reward models, or
+        an LLM final-answer call once real tools are connected.
+        """
+        if confidence >= 0.85 and value >= 0.65:
+            verdict = "SUPPORTED / HIGH_CONFIDENCE"
+        elif confidence <= 0.35 or value <= 0.35:
+            verdict = "INSUFFICIENT_EVIDENCE / LOW_CONFIDENCE"
+        else:
+            verdict = "UNCERTAIN / NEED_MORE_EVIDENCE"
+
+        evidence_preview = "\n".join(f"- {item}" for item in evidence[:5]) or "- <no evidence>"
         return (
-            "Final answer generated from the best MCTS trajectory. "
-            "Replace MockLLMController with a real LLM implementation."
+            f"Decision: {verdict}\n"
+            f"Query: {query}\n"
+            f"Fused value: {value:.3f}\n"
+            f"Confidence: {confidence:.3f}\n"
+            f"Evidence used:\n{evidence_preview}\n"
+            f"Trajectory length: {len(trajectory)}"
         )
+
+
+__all__ = ["LLMController", "T2Agent", "AgentDecision"]

@@ -1,165 +1,137 @@
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
-from typing import Dict, List
-
-import torch
-
-from .graph import ClaimNode, EvidenceGraph, EvidenceNode, RelationType
+import re
+from typing import Callable, List, Optional, Tuple
 
 
-@dataclass
-class FinalDecision:
-    prediction: str
-    confidence: float
-    explanation: str
-    evidence_paths: List[List[str]]
-    claim_scores: Dict[str, float]
-    graph_reward: float
+class Evaluator:
+    """Dual-value evaluator for LLM-driven MCTS trajectories.
 
-
-class GraphEvaluator:
-    """Conflict-aware structural evaluator for CAGE evidence graphs."""
+    The default implementation is a deterministic heuristic so the framework is
+    runnable without an LLM. Production systems should inject an `llm_score_fn`
+    that calls a large model with the prompts built below and parses structured
+    scores from its response.
+    """
 
     def __init__(
         self,
-        support_weight: float = 1.0,
-        refute_weight: float = 1.2,
-        conflict_penalty: float = 1.5,
-        unresolved_claim_penalty: float = 0.3,
-        source_diversity_weight: float = 0.2,
+        alpha: float = 0.5,
+        llm_score_fn: Optional[Callable[[str], Tuple[float, str]]] = None,
     ) -> None:
-        self.support_weight = support_weight
-        self.refute_weight = refute_weight
-        self.conflict_penalty = conflict_penalty
-        self.unresolved_claim_penalty = unresolved_claim_penalty
-        self.source_diversity_weight = source_diversity_weight
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError("alpha must be in [0, 1]")
+        self.alpha = alpha
+        self.llm_score_fn = llm_score_fn
 
-    def evaluate_trajectory(self, graph: EvidenceGraph) -> float:
-        reward = 0.0
-        for claim in graph.get_claim_nodes():
-            reward += self.score_claim(graph, claim)
-            if not claim.verified:
-                reward -= self.unresolved_claim_penalty
-            if graph.claim_has_unresolved_conflict(claim):
-                reward -= self.conflict_penalty
-        reward += self._source_diversity_bonus(graph)
-        return reward / max(graph.num_claims(), 1)
+    def evaluate_trajectory(self, history: list) -> float:
+        """Compute S^T: reasoning trajectory coherence score in [0, 1]."""
+        prompt = self.build_trajectory_prompt(history)
+        if self.llm_score_fn is not None:
+            score, _ = self.llm_score_fn(prompt)
+            return self._clip(score)
 
-    def score_claim(self, graph: EvidenceGraph, claim: ClaimNode) -> float:
-        support_score = 0.0
-        refute_score = 0.0
-        neutral_score = 0.0
-        conflict_score = 0.0
+        if not history:
+            return 0.0
+        valid_steps = 0
+        for step in history:
+            thought = str(step.get("thought", "")).strip()
+            action = str(step.get("action", "")).strip()
+            observation = str(step.get("observation", "")).strip()
+            if thought and (action or observation):
+                valid_steps += 1
+        base = valid_steps / max(len(history), 1)
+        failed = sum("error" in str(step.get("observation", "")).lower() for step in history)
+        penalty = min(0.3, 0.1 * failed)
+        return self._clip(base - penalty)
 
-        for evidence, edge_attr in graph.incoming_evidence_edges(claim):
-            relation = edge_attr.get("relation_type")
-            contribution = float(edge_attr.get("weight", 1.0)) * evidence.credibility_score
-            if relation == RelationType.SUPPORT:
-                support_score += contribution
-            elif relation == RelationType.REFUTE:
-                refute_score += contribution
-            elif relation == RelationType.CONFLICT:
-                conflict_score += contribution
-            elif relation == RelationType.NEUTRAL:
-                neutral_score += 0.1 * contribution
+    def evaluate_confidence(self, evidence: list, query: str) -> float:
+        """Compute S^C: evidence sufficiency confidence score in [0, 1]."""
+        prompt = self.build_confidence_prompt(evidence, query)
+        if self.llm_score_fn is not None:
+            score, _ = self.llm_score_fn(prompt)
+            return self._clip(score)
 
-        return (
-            self.support_weight * support_score
-            - self.refute_weight * refute_score
-            - self.conflict_penalty * conflict_score
-            + neutral_score
-            - 0.2 * claim.uncertainty_score
-        )
+        if not evidence:
+            return 0.0
+        joined = "\n".join(str(item) for item in evidence).lower()
+        decisive_markers = ["support", "refute", "true", "fake", "forgery", "manipulation", "retrieved"]
+        marker_hits = sum(marker in joined for marker in decisive_markers)
+        diversity_bonus = min(0.25, 0.05 * len(evidence))
+        length_bonus = min(0.25, len(joined) / 1200.0)
+        marker_bonus = min(0.5, 0.1 * marker_hits)
+        return self._clip(0.15 + diversity_bonus + length_bonus + marker_bonus)
 
-    def make_final_decision(self, graph: EvidenceGraph) -> FinalDecision:
-        claim_scores = {claim.node_id: self.score_claim(graph, claim) for claim in graph.get_claim_nodes()}
-        graph_reward = self.evaluate_trajectory(graph)
-        if not claim_scores:
-            return FinalDecision("Unknown", 0.0, "No claims available for verification.", [], {}, graph_reward)
+    def combine_scores(self, trajectory_score: float, confidence_score: float) -> float:
+        """Combine V(s) = alpha * S^T + (1 - alpha) * S^C."""
+        return self._clip(self.alpha * trajectory_score + (1.0 - self.alpha) * confidence_score)
 
-        mean_claim_score = sum(claim_scores.values()) / len(claim_scores)
-        if mean_claim_score >= 0.25 and graph_reward >= 0.0:
-            prediction = "True"
-        elif mean_claim_score <= -0.25 or graph_reward < -0.25:
-            prediction = "Fake"
-        else:
-            prediction = "Uncertain"
+    def evaluate(self, history: list, evidence: list, query: str) -> Tuple[float, float, float]:
+        """Return (S^T, S^C, V)."""
+        trajectory_score = self.evaluate_trajectory(history)
+        confidence_score = self.evaluate_confidence(evidence, query)
+        value = self.combine_scores(trajectory_score, confidence_score)
+        return trajectory_score, confidence_score, value
 
-        confidence = torch.sigmoid(torch.tensor(abs(mean_claim_score))).item()
-        evidence_paths = self._extract_explainable_paths(graph)
-        explanation = self._build_explanation(graph, prediction, confidence, claim_scores, evidence_paths, graph_reward)
-        return FinalDecision(prediction, confidence, explanation, evidence_paths, claim_scores, graph_reward)
+    def build_trajectory_prompt(self, history: list) -> str:
+        """Prompt placeholder for LLM-based trajectory scoring.
 
-    def build_llm_graph_of_thoughts_prompt(self, graph: EvidenceGraph) -> str:
-        lines = [
-            "You are a multimodal misinformation verification judge.",
-            "Reason over support, refutation, conflicts, source credibility, and unresolved claims.",
-            "",
-            "CLAIMS:",
-        ]
-        for claim in graph.get_claim_nodes():
-            lines.append(
-                f"- Claim ID: {claim.node_id}\n"
-                f"  Text: {claim.claim_text}\n"
-                f"  Modality: {claim.modality.value}\n"
-                f"  Uncertainty: {claim.uncertainty_score}\n"
-                f"  Verified: {claim.verified}"
-            )
-        lines.append("\nEVIDENCE EDGES:")
-        for source_id, target_id, edge_attr in graph.graph.edges(data=True):
-            source = graph.get_node(source_id)
-            target = graph.get_node(target_id)
-            source_text = source.content if isinstance(source, EvidenceNode) else source.claim_text
-            target_text = target.content if isinstance(target, EvidenceNode) else target.claim_text
-            lines.append(
-                f"- {source_id} -> {target_id}\n"
-                f"  Relation: {edge_attr.get('relation_type')}\n"
-                f"  Source text: {source_text}\n"
-                f"  Target text: {target_text}\n"
-                f"  Edge weight: {edge_attr.get('weight', 1.0)}"
-            )
-        lines.extend([
-            "",
-            "TASK:",
-            "1. Identify supported, refuted, and unresolved claims.",
-            "2. Identify unresolved conflicts.",
-            "3. Decide whether the multimodal post is True, Fake, or Uncertain.",
-            "4. Return an explainable evidence path for the decision.",
-        ])
-        return "\n".join(lines)
+        Expected LLM input:
+            - Full Thought/Action/Observation trajectory.
+        Expected LLM output:
+            JSON object: {"score": float in [0,1], "explanation": string}
+        """
+        return f"""
+You are an expert evaluator for tool-augmented reasoning agents.
 
-    def _source_diversity_bonus(self, graph: EvidenceGraph) -> float:
-        sources = {evidence.source for evidence in graph.get_evidence_nodes()}
-        return self.source_diversity_weight * math.log1p(len(sources))
+Evaluate the logical coherence of the following Thought-Action-Observation trajectory.
+Focus on whether each action follows from the thought, whether each observation is used correctly,
+and whether the chain avoids unsupported jumps or contradictions.
 
-    def _extract_explainable_paths(self, graph: EvidenceGraph) -> List[List[str]]:
-        paths: List[List[str]] = []
-        for claim in graph.get_claim_nodes():
-            for evidence, edge_attr in graph.incoming_evidence_edges(claim):
-                paths.append([evidence.node_id, str(edge_attr.get("relation_type")), claim.node_id])
-        return paths
+Trajectory:
+{history}
 
-    def _build_explanation(
-        self,
-        graph: EvidenceGraph,
-        prediction: str,
-        confidence: float,
-        claim_scores: Dict[str, float],
-        evidence_paths: List[List[str]],
-        graph_reward: float,
-    ) -> str:
-        lines = [f"Final prediction: {prediction}", f"Confidence: {confidence:.3f}", f"Graph reward: {graph_reward:.3f}", "", "Claim scores:"]
-        for claim in graph.get_claim_nodes():
-            lines.append(
-                f"- {claim.claim_text}\n"
-                f"  ID: {claim.node_id}\n"
-                f"  Score: {claim_scores.get(claim.node_id, 0.0):.3f}\n"
-                f"  Verified: {claim.verified}\n"
-                f"  Unresolved conflict: {graph.claim_has_unresolved_conflict(claim)}"
-            )
-        lines.append("\nEvidence paths:")
-        for path in evidence_paths:
-            lines.append(f"- {' -> '.join(path)}")
-        return "\n".join(lines)
+Return strict JSON:
+{{
+  "score": <float between 0 and 1>,
+  "explanation": "<short explanation>"
+}}
+""".strip()
+
+    def build_confidence_prompt(self, evidence: list, query: str) -> str:
+        """Prompt placeholder for LLM-based evidence confidence scoring.
+
+        Expected LLM input:
+            - User query.
+            - Leaf-node evidence/observations.
+        Expected LLM output:
+            JSON object: {"score": float in [0,1], "is_decisive": bool, "explanation": string}
+        """
+        return f"""
+You are an expert evaluator for evidence sufficiency.
+
+User query:
+{query}
+
+Collected evidence:
+{evidence}
+
+Evaluate whether the evidence is sufficient to make a reliable final decision.
+Consider evidence relevance, credibility, redundancy, conflicts, and missing information.
+
+Return strict JSON:
+{{
+  "score": <float between 0 and 1>,
+  "is_decisive": <true or false>,
+  "explanation": "<short explanation>"
+}}
+""".strip()
+
+    def _clip(self, value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+
+# Backward-compatible lightweight graph evaluator placeholder for earlier CAGE code.
+class GraphEvaluator(Evaluator):
+    """Compatibility alias for earlier graph-oriented CAGE experiments."""
+
+    pass
