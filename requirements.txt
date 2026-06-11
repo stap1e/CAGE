@@ -1,0 +1,6 @@
+# CAGE dependencies
+networkx>=3.0
+torch>=2.0
+pillow>=10.0
+pandas>=2.0
+pyarrow>=14.0

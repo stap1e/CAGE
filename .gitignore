@@ -1,0 +1,253 @@
+# ============================================================
+# CAGE .gitignore
+# Python / PyTorch / multimodal datasets / experiments / local scratch
+# ============================================================
+
+# ------------------------------------------------------------
+# Python bytecode and caches
+# ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# ------------------------------------------------------------
+# Virtual environments and local Python tooling
+# ------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+conda-env/
+.python-version
+pip-wheel-metadata/
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+site/
+
+# ------------------------------------------------------------
+# Jupyter / notebooks
+# ------------------------------------------------------------
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# ------------------------------------------------------------
+# IDE / editor / OS files
+# ------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+desktop.ini
+
+# ------------------------------------------------------------
+# Claude Code local/session settings
+# Keep project-shared settings trackable if intentionally added,
+# but ignore local user/session overrides.
+# ------------------------------------------------------------
+.claude/settings.local.json
+.claude/worktrees/
+.claude/scheduled_tasks.json
+
+# ------------------------------------------------------------
+# Secrets and credentials
+# ------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+credentials/
+configs/local*.yaml
+configs/local*.yml
+configs/local*.json
+
+# ------------------------------------------------------------
+# Large local datasets and raw media
+# Never commit MMFakeBench / Hints-of-Truth contents.
+# Use absolute local paths or symlinks in config instead.
+# ------------------------------------------------------------
+data/
+datasets/
+raw_data/
+processed_data/
+external_data/
+local_data/
+MMFakeBench/
+hints_of_truth/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.parquet
+*.arrow
+*.h5
+*.hdf5
+*.lmdb
+*.sqlite
+*.sqlite3
+*.db
+
+# Common media dumps. Remove a pattern if you intentionally version
+# a small curated asset under docs/ or tests/fixtures/.
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.webp
+*.tif
+*.tiff
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.wav
+*.mp3
+*.flac
+
+# Allow explicit lightweight documentation assets if needed.
+!docs/**/*.png
+!docs/**/*.jpg
+!docs/**/*.jpeg
+!tests/fixtures/**/*.png
+!tests/fixtures/**/*.jpg
+!tests/fixtures/**/*.jpeg
+
+# ------------------------------------------------------------
+# ML checkpoints / model artifacts
+# ------------------------------------------------------------
+checkpoints/
+ckpts/
+models/
+pretrained/
+weights/
+artifacts/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+*.engine
+*.tflite
+*.pb
+
+# ------------------------------------------------------------
+# Experiment outputs and tracking
+# ------------------------------------------------------------
+outputs/
+output/
+results/
+result/
+runs/
+logs/
+log/
+wandb/
+mlruns/
+tensorboard/
+lightning_logs/
+ray_results/
+
+# Formal experiments can be committed under experiments/ if curated.
+# Ignore ad-hoc/non-formal experiment scratch by convention.
+experiments/tmp*/
+experiments/debug*/
+experiments/draft*/
+experiments/scratch*/
+experiments/adhoc*/
+experiments/smoke*/
+experiments/test*/
+experiments/local*/
+
+# ------------------------------------------------------------
+# Not formal experiment / scratch scripts
+# ------------------------------------------------------------
+scratch/
+sandbox/
+playground/
+tmp/
+temp/
+debug/
+notebooks/scratch/
+notebooks/tmp/
+
+# Ad-hoc generated examples and one-off probes.
+# Keep real reusable examples by moving them under examples/ and removing
+# the matching line if you want them versioned.
+examples_agent_mcts_run.py
+examples_cage_run.py
+*_debug.py
+*_scratch.py
+*_tmp.py
+*_test_run.py
+run_local*.py
+try_*.py
+probe_*.py
+
+# ------------------------------------------------------------
+# Reports, generated papers, and temporary writing artifacts
+# ------------------------------------------------------------
+*.log
+*.out
+*.err
+*.tmp
+*.bak
+*.backup
+*.orig
+*.rej
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.toc
+*.lof
+*.lot
+*.nav
+*.snm
+*.vrb
+
+# ------------------------------------------------------------
+# Package manager / build caches
+# ------------------------------------------------------------
+.tox/
+.nox/
+.hypothesis/
+.pybuilder/
+poetry.lock
+Pipfile.lock
+
+# ------------------------------------------------------------
+# System resource / profiling dumps
+# ------------------------------------------------------------
+*.prof
+*.pstats
+*.trace
+*.dump
+core
+core.*
