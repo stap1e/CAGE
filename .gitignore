@@ -24,6 +24,7 @@ htmlcov/
 # Virtual environments and local Python tooling
 # ------------------------------------------------------------
 .venv/
+.claude/
 venv/
 env/
 ENV/
@@ -211,6 +212,7 @@ probe_*.py
 # ------------------------------------------------------------
 # Reports, generated papers, and temporary writing artifacts
 # ------------------------------------------------------------
+problem.md
 *.log
 *.out
 *.err
