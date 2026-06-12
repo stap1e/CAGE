@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 import re
-from typing import Callable, List, Optional, Tuple
+import statistics
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
+
+import torch
+
+from cage.gcn import PolicyValueGCN
+from cage.graph import DynamicEvidenceGraph, RelationType
 
 
 TRAJECTORY_EVAL_PROMPT = """
@@ -44,57 +51,204 @@ Evidence:
 """.strip()
 
 
-class Evaluator:
-    """Dual-value evaluator for T2/CAGE MCTS.
+@dataclass
+class DecisionCandidate:
+    """A single candidate reasoning path used in final decision making."""
 
-    `llm_score_fn` is an optional provider hook. It receives a prompt and should
-    return `(score_1_to_10, explanation)`. If absent, deterministic heuristics
-    keep the system runnable on a bare Ubuntu server.
-    """
+    history: Sequence[Mapping[str, Any]]
+    evidence: Sequence[str]
+    graph_state: Optional[DynamicEvidenceGraph]
+    llm_confidence: float
+    path_score: float
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class FinalDecision:
+    """Final graph-aware misinformation decision."""
+
+    verdict: str
+    fake_probability: float
+    confidence: float
+    rationale: str
+    path_breakdown: list[Dict[str, float]]
+
+
+class Evaluator:
+    """Dual-value evaluator with graph-aware conflict fusion."""
 
     def __init__(
         self,
-        alpha: float = 0.5,
+        alpha: float = 0.30,
+        beta: float = 0.35,
+        gamma: float = 0.35,
         llm_score_fn: Optional[Callable[[str], Tuple[float, str]]] = None,
+        graph_model: Optional[PolicyValueGCN] = None,
     ) -> None:
-        if not 0.0 <= alpha <= 1.0:
-            raise ValueError("alpha must be in [0, 1]")
-        self.alpha = alpha
-        self.llm_score_fn = llm_score_fn
+        if min(alpha, beta, gamma) < 0.0:
+            raise ValueError("alpha, beta, gamma must be non-negative")
+        if alpha + beta + gamma <= 0:
+            raise ValueError("alpha + beta + gamma must be > 0")
 
-    def evaluate_trajectory(self, history: list) -> float:
-        """Compute normalized S^T in [0, 1]."""
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.llm_score_fn = llm_score_fn
+        self.graph_model = graph_model
+
+    def evaluate_trajectory(self, history: Sequence[Mapping[str, Any]]) -> float:
         prompt = self.build_trajectory_prompt(history)
         if self.llm_score_fn is not None:
             raw_score, _ = self.llm_score_fn(prompt)
             return self._score_1_to_10_to_unit(raw_score)
         return self._heuristic_trajectory_score(history)
 
-    def evaluate_confidence(self, evidence: list, query: str) -> float:
-        """Compute normalized S^C in [0, 1]."""
+    def evaluate_confidence(self, evidence: Sequence[str], query: str) -> float:
         prompt = self.build_confidence_prompt(evidence, query)
         if self.llm_score_fn is not None:
             raw_score, _ = self.llm_score_fn(prompt)
             return self._score_1_to_10_to_unit(raw_score)
         return self._heuristic_confidence_score(evidence)
 
-    def combine_scores(self, trajectory_score: float, confidence_score: float) -> float:
-        """V(s) = alpha * S^T + (1 - alpha) * S^C."""
-        return self._clip(self.alpha * trajectory_score + (1.0 - self.alpha) * confidence_score)
+    def infer_graph_conflict(self, graph_state: Optional[DynamicEvidenceGraph]) -> float:
+        if graph_state is None:
+            return 0.5
 
-    def evaluate(self, history: list, evidence: list, query: str) -> Tuple[float, float, float]:
+        if self.graph_model is not None:
+            try:
+                with torch.no_grad():
+                    return float(self.graph_model.conflict_score(graph_state))
+            except Exception:
+                pass
+
+        total_support = 0
+        total_refute = 0
+        total_conflict = 0
+
+        for _, _, _, edge_attr in graph_state.graph.edges(keys=True, data=True):
+            relation = edge_attr.get("relation_type")
+            if relation == RelationType.SUPPORT:
+                total_support += 1
+            elif relation == RelationType.REFUTE:
+                total_refute += 1
+            elif relation == RelationType.CONFLICT:
+                total_conflict += 1
+
+        contradiction_mass = min(total_support, total_refute)
+        raw_conflict = total_conflict + contradiction_mass
+        denom = max(total_support + total_refute + total_conflict, 1)
+        return self._clip(raw_conflict / denom)
+
+    def combine_scores(
+        self,
+        trajectory_score: float,
+        confidence_score: float,
+        graph_conflict_score: float,
+    ) -> float:
+        graph_consistency = 1.0 - graph_conflict_score
+        weighted = (
+            self.alpha * trajectory_score
+            + self.beta * confidence_score
+            + self.gamma * graph_consistency
+        )
+        return self._clip(weighted / (self.alpha + self.beta + self.gamma))
+
+    def evaluate(
+        self,
+        history: Sequence[Mapping[str, Any]],
+        evidence: Sequence[str],
+        query: str,
+        graph_state: Optional[DynamicEvidenceGraph] = None,
+        llm_confidence: Optional[float] = None,
+    ) -> Tuple[float, float, float]:
         trajectory_score = self.evaluate_trajectory(history)
-        confidence_score = self.evaluate_confidence(evidence, query)
-        return trajectory_score, confidence_score, self.combine_scores(trajectory_score, confidence_score)
+        confidence_score = llm_confidence if llm_confidence is not None else self.evaluate_confidence(evidence, query)
+        confidence_score = self._clip(confidence_score)
+        graph_conflict_score = self.infer_graph_conflict(graph_state)
+        value = self.combine_scores(trajectory_score, confidence_score, graph_conflict_score)
+        return trajectory_score, confidence_score, value
 
-    def build_trajectory_prompt(self, history: list) -> str:
-        return TRAJECTORY_EVAL_PROMPT.format(history=history)
+    def make_final_decision(
+        self,
+        candidates: Sequence[DecisionCandidate],
+        query: str,
+    ) -> FinalDecision:
+        if not candidates:
+            return FinalDecision(
+                verdict="Uncertain",
+                fake_probability=0.5,
+                confidence=0.0,
+                rationale="No valid reasoning path was produced by MCTS.",
+                path_breakdown=[],
+            )
 
-    def build_confidence_prompt(self, evidence: list, query: str) -> str:
-        return CONFIDENCE_EVAL_PROMPT.format(query=query, evidence=evidence)
+        path_breakdown: list[Dict[str, float]] = []
+        fake_scores: list[float] = []
+        conflict_scores: list[float] = []
+        weights: list[float] = []
+
+        for idx, candidate in enumerate(candidates):
+            llm_conf = self._clip(candidate.llm_confidence)
+            graph_conflict = self.infer_graph_conflict(candidate.graph_state)
+            path_weight = max(candidate.path_score, 1e-4)
+            fake_score = self._clip(0.65 * graph_conflict + 0.35 * (1.0 - llm_conf))
+
+            path_breakdown.append(
+                {
+                    "path_index": float(idx),
+                    "path_weight": float(path_weight),
+                    "llm_confidence": float(llm_conf),
+                    "graph_conflict": float(graph_conflict),
+                    "fake_score": float(fake_score),
+                }
+            )
+            fake_scores.append(fake_score)
+            conflict_scores.append(graph_conflict)
+            weights.append(path_weight)
+
+        norm_weights = [w / sum(weights) for w in weights]
+        weighted_fake = sum(w * s for w, s in zip(norm_weights, fake_scores))
+        avg_conflict = sum(w * s for w, s in zip(norm_weights, conflict_scores))
+        disagreement = statistics.pstdev(fake_scores) if len(fake_scores) > 1 else 0.0
+
+        graph_dominance = self._clip(0.35 + 0.35 * avg_conflict + 0.30 * disagreement)
+        llm_dominance = 1.0 - graph_dominance
+        weighted_llm_fake = sum(w * (1.0 - p["llm_confidence"]) for w, p in zip(norm_weights, path_breakdown))
+        final_fake_probability = self._clip(
+            graph_dominance * weighted_fake + llm_dominance * weighted_llm_fake
+        )
+
+        if final_fake_probability >= 0.58:
+            verdict = "Fake"
+        elif final_fake_probability <= 0.42:
+            verdict = "True"
+        else:
+            verdict = "Uncertain"
+
+        confidence = self._clip(2.0 * abs(final_fake_probability - 0.5))
+        rationale = (
+            f"Graph-aware decision for query='{query}': "
+            f"avg_conflict={avg_conflict:.3f}, path_disagreement={disagreement:.3f}, "
+            f"graph_weight={graph_dominance:.3f}, final_fake_probability={final_fake_probability:.3f}. "
+            f"High graph conflict or strong path disagreement causes the decision logic "
+            f"to trust graph-level structure more than a single optimistic LLM path."
+        )
+
+        return FinalDecision(
+            verdict=verdict,
+            fake_probability=final_fake_probability,
+            confidence=confidence,
+            rationale=rationale,
+            path_breakdown=path_breakdown,
+        )
+
+    def build_trajectory_prompt(self, history: Sequence[Mapping[str, Any]]) -> str:
+        return TRAJECTORY_EVAL_PROMPT.format(history=list(history))
+
+    def build_confidence_prompt(self, evidence: Sequence[str], query: str) -> str:
+        return CONFIDENCE_EVAL_PROMPT.format(query=query, evidence=list(evidence))
 
     def parse_score_from_text(self, text: str, kind: str) -> float:
-        """Parse required score sentence from LLM output and return [0, 1]."""
         if kind == "trajectory":
             pattern = r"Thus the correctness score is\s+([1-9]|10)"
         elif kind == "confidence":
@@ -106,30 +260,49 @@ class Evaluator:
             raise ValueError(f"Could not parse {kind} score from LLM output")
         return self._score_1_to_10_to_unit(float(match.group(1)))
 
-    def _heuristic_trajectory_score(self, history: list) -> float:
+    def _heuristic_trajectory_score(self, history: Sequence[Mapping[str, Any]]) -> float:
         if not history:
             return 0.0
+
         valid_steps = 0
+        contradiction_penalty = 0.0
         for step in history:
             thought = str(step.get("thought", "")).strip()
             action = str(step.get("action", "")).strip()
-            observation = str(step.get("observation", "")).strip()
+            observation = str(step.get("observation", "")).strip().lower()
+
             if thought and (action or observation):
                 valid_steps += 1
-        base = valid_steps / max(len(history), 1)
-        failed = sum("error" in str(step.get("observation", "")).lower() for step in history)
-        return self._clip(base - min(0.3, 0.1 * failed))
+            if "error" in observation or "failed" in observation:
+                contradiction_penalty += 0.1
+            if "contradiction" in observation or "inconsistent" in observation:
+                contradiction_penalty += 0.08
 
-    def _heuristic_confidence_score(self, evidence: list) -> float:
+        base = valid_steps / max(len(history), 1)
+        return self._clip(base - min(0.35, contradiction_penalty))
+
+    def _heuristic_confidence_score(self, evidence: Sequence[str]) -> float:
         if not evidence:
             return 0.0
+
         joined = "\n".join(str(item) for item in evidence).lower()
-        decisive_markers = ["support", "refute", "true", "fake", "forgery", "manipulation", "retrieved", "entity"]
-        marker_hits = sum(marker in joined for marker in decisive_markers)
+        supportive_markers = [
+            "retrieved",
+            "entity",
+            "matched",
+            "support",
+            "refute",
+            "forgery",
+            "manipulation",
+            "source",
+            "image",
+            "claim",
+        ]
+        hits = sum(marker in joined for marker in supportive_markers)
         diversity_bonus = min(0.25, 0.05 * len(evidence))
-        length_bonus = min(0.25, len(joined) / 1200.0)
-        marker_bonus = min(0.5, 0.1 * marker_hits)
-        return self._clip(0.15 + diversity_bonus + length_bonus + marker_bonus)
+        marker_bonus = min(0.40, 0.06 * hits)
+        length_bonus = min(0.20, len(joined) / 1500.0)
+        return self._clip(0.15 + diversity_bonus + marker_bonus + length_bonus)
 
     def _score_1_to_10_to_unit(self, score: float) -> float:
         return self._clip((float(score) - 1.0) / 9.0)
